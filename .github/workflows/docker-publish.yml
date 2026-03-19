@@ -16,18 +16,38 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Strategy: build each platform on a native runner, push individual manifests
+# by digest, then merge them into a single multi-arch manifest list.
+# This avoids slow QEMU emulation for a source-compiled image like Janus.
+# ─────────────────────────────────────────────────────────────────────────────
+
 jobs:
   build:
-    name: Build${{ github.event_name != 'pull_request' && ' and Push' || '' }}
-    runs-on: ubuntu-latest
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
-      id-token: write          # needed for attestation (optional, harmless if unused)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm   # native ARM64 GitHub-hosted runner
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Derive a filesystem-safe slug from the platform (e.g. linux-arm64)
+      - name: Prepare environment
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_SLUG=${platform//\//-}" >> "$GITHUB_ENV"
+          mkdir -p /tmp/digests
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -40,45 +60,123 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Derive image tags and OCI labels automatically from repo metadata
-      - name: Extract Docker metadata
+      # OCI labels only; tags are applied in the merge job
+      - name: Extract metadata (labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      # ── PR: build only, no push ────────────────────────────────────────────
+      - name: Build (PR – validate only)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ env.PLATFORM_SLUG }}
+          cache-to: type=gha,scope=${{ env.PLATFORM_SLUG }},mode=max
+
+      # ── Branch / tag: build and push by digest (no tag yet) ───────────────
+      - name: Build and push by digest
+        if: github.event_name != 'pull_request'
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ env.PLATFORM_SLUG }}
+          cache-to: type=gha,scope=${{ env.PLATFORM_SLUG }},mode=max
+
+      # Store the digest in a tiny file named after it (consumed by merge job)
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_SLUG }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Merge: combine per-arch digests into a single multi-arch manifest list
+  # ───────────────────────────────────────────────────────────────────────────
+  merge:
+    name: Merge manifests and publish
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # needed for build provenance attestation
+
+    steps:
+      - name: Download all digest artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata (tags + labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            # branch builds: ghcr.io/<org>/<repo>:<branch>
+            # branch builds → :<branch>
             type=ref,event=branch
-            # PR builds: ghcr.io/<org>/<repo>:pr-<number>
+            # PR builds → :pr-<number>
             type=ref,event=pr
-            # semver tag v1.2.3 → :1.2.3 and :1.2 and :1
+            # semver tag v1.2.3 → :1.2.3, :1.2, :1
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            # always pin the exact commit SHA
+            # exact commit SHA
             type=sha,format=long
-            # mark latest only on the default branch
+            # :latest on the default branch only
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build${{ github.event_name != 'pull_request' && ' and push' || '' }} image
-        uses: docker/build-push-action@v6
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          context: .
-          file: Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # Layer caching via GitHub Actions cache backend
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          # Export image digest for attestation step
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=false,name-canonical=true
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build a multi-arch manifest list from all per-arch digests
+      - name: Create and push multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "${DOCKER_METADATA_OUTPUT_JSON}") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect published manifest
+        run: |
+          docker buildx imagetools inspect \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
 
       - name: Attest build provenance
-        if: github.event_name != 'pull_request'
         uses: actions/attest-build-provenance@v1
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-digest: ${{ needs.build.outputs.digest }}
           push-to-registry: true
-        continue-on-error: true   # non-blocking: attestation is best-effort
+        continue-on-error: true   # best-effort; does not block the release

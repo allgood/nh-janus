@@ -95,13 +95,13 @@ Final negotiated codec set depends on:
 
 ## GitHub Actions / GHCR
 
-The workflow at [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml) automatically:
+The workflow at [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml) automatically builds for **`linux/amd64` and `linux/arm64`** using native GitHub-hosted runners, then merges both into a single multi-arch manifest list.
 
 | Event | What happens |
 |---|---|
-| Push to `main`/`master` | Build → push `:latest` + `:sha-<hash>` |
-| Push of `v*.*.*` tag | Build → push `:1.2.3`, `:1.2`, `:1` + `:latest` |
-| Pull request | Build only (no push), layer cache preserved |
+| Push to `main`/`master` | Build both arches → push `:latest` + `:sha-<hash>` |
+| Push of `v*.*.*` tag | Build both arches → push `:1.2.3`, `:1.2`, `:1` + `:latest` |
+| Pull request | Build both arches only (no push), layer cache preserved |
 
 The image is published to **GitHub Container Registry** under:
 
@@ -110,6 +110,8 @@ ghcr.io/<your-org-or-user>/<repo-name>:<tag>
 ```
 
 `GITHUB_TOKEN` is used automatically—no extra secrets required.
+
+> **ARM64 runner note**: the workflow uses `ubuntu-24.04-arm` (GitHub-hosted native ARM64 runner). These are free on public repositories and available on Team/Enterprise plans for private repos. Native runners are used instead of QEMU to keep build times reasonable for a source-compiled image.
 
 > First push: GHCR packages are private by default. To make the image public, go to
 > `https://github.com/<org>/<repo>/pkgs/container/<repo-name>` → *Package settings* → *Change visibility*.
