@@ -1,7 +1,8 @@
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV JANUS_VERSION=v1.2.6
+ARG JANUS_VERSION=v1.4.0
+ENV JANUS_VERSION=${JANUS_VERSION}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
