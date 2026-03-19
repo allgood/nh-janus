@@ -93,6 +93,39 @@ Final negotiated codec set depends on:
 - SIP server/SBC capabilities;
 - SDP offer/answer negotiation.
 
+## GitHub Actions / GHCR
+
+The workflow at [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml) automatically:
+
+| Event | What happens |
+|---|---|
+| Push to `main`/`master` | Build → push `:latest` + `:sha-<hash>` |
+| Push of `v*.*.*` tag | Build → push `:1.2.3`, `:1.2`, `:1` + `:latest` |
+| Pull request | Build only (no push), layer cache preserved |
+
+The image is published to **GitHub Container Registry** under:
+
+```
+ghcr.io/<your-org-or-user>/<repo-name>:<tag>
+```
+
+`GITHUB_TOKEN` is used automatically—no extra secrets required.
+
+> First push: GHCR packages are private by default. To make the image public, go to
+> `https://github.com/<org>/<repo>/pkgs/container/<repo-name>` → *Package settings* → *Change visibility*.
+
+### Pull the published image
+
+```bash
+docker pull ghcr.io/<your-org-or-user>/<repo-name>:latest
+```
+
+Or in `docker-compose.yml`, replace the `build:` block with:
+
+```yaml
+image: ghcr.io/<your-org-or-user>/<repo-name>:latest
+```
+
 ## Production recommendations
 
 - Set `JANUS_NAT_1_1_MAPPING` when container is behind NAT.
